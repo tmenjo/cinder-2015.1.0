@@ -19,6 +19,7 @@ SheepDog Volume Driver.
 
 """
 import re
+import six
 
 from oslo_concurrency import processutils
 from oslo_config import cfg
@@ -34,8 +35,19 @@ from cinder.volume import driver
 
 LOG = logging.getLogger(__name__)
 
+sheepdog_opts = [
+    cfg.StrOpt('sheepdog_store_address',
+               default='127.0.0.1',
+               help=('IP address of sheep daemon.')),
+    cfg.IntOpt('sheepdog_store_port',
+               min=1, max=65535,
+               default=7000,
+               help=('Port of sheep daemon.'))
+]
+
 CONF = cfg.CONF
 CONF.import_opt("image_conversion_dir", "cinder.image.image_utils")
+CONF.register_opts(sheepdog_opts)
 
 
 class SheepdogDriver(driver.VolumeDriver):
@@ -45,6 +57,9 @@ class SheepdogDriver(driver.VolumeDriver):
 
     def __init__(self, *args, **kwargs):
         super(SheepdogDriver, self).__init__(*args, **kwargs)
+        self.configuration.append_config_values(sheepdog_opts)
+        self.addr = self.configuration.sheepdog_store_address
+        self.port = six.text_type(self.configuration.sheepdog_store_port)
         self.stats_pattern = re.compile(r'[\w\s%]*Total\s(\d+)\s(\d+)*')
         self._stats = {}
 
@@ -54,7 +69,7 @@ class SheepdogDriver(driver.VolumeDriver):
             # NOTE(francois-charlier) Since 0.24 'collie cluster info -r'
             # gives short output, but for compatibility reason we won't
             # use it and just check if 'running' is in the output.
-            (out, _err) = self._execute('collie', 'cluster', 'info')
+            (out, _err) = self._execute('collie', 'cluster', 'info', '-a', self.addr, '-p', self.port)
             if 'status: running' not in out:
                 exception_message = (_("Sheepdog is not working: %s") % out)
                 raise exception.VolumeBackendAPIException(
@@ -142,15 +157,15 @@ class SheepdogDriver(driver.VolumeDriver):
     def create_volume(self, volume):
         """Create a sheepdog volume."""
         self._try_execute('qemu-img', 'create',
-                          "sheepdog:%s" % volume['name'],
+                          "sheepdog:%s:%s:%s" % (self.addr, self.port, volume['name']),
                           '%sG' % volume['size'])
 
     def create_volume_from_snapshot(self, volume, snapshot):
         """Create a sheepdog volume from a snapshot."""
         self._try_execute('qemu-img', 'create', '-b',
-                          "sheepdog:%s:%s" % (snapshot['volume_name'],
+                          "sheepdog:%s:%s:%s:%s" % (self.addr, self.port, snapshot['volume_name'],
                                               snapshot['name']),
-                          "sheepdog:%s" % volume['name'],
+                          "sheepdog:%s:%s:%s" % (self.addr, self.port, volume['name']),
                           '%sG' % volume['size'])
 
     def delete_volume(self, volume):
@@ -161,11 +176,11 @@ class SheepdogDriver(driver.VolumeDriver):
         if not size:
             size = int(volume['size']) * units.Gi
 
-        self._try_execute('collie', 'vdi', 'resize',
+        self._try_execute('collie', 'vdi', 'resize', '-a', self.addr, '-p', self.port,
                           volume['name'], size)
 
     def _delete(self, volume):
-        self._try_execute('collie', 'vdi', 'delete',
+        self._try_execute('collie', 'vdi', 'delete', '-a', self.addr, '-p', self.port,
                           volume['name'])
 
     def copy_image_to_volume(self, context, volume, image_service, image_id):
@@ -178,7 +193,7 @@ class SheepdogDriver(driver.VolumeDriver):
             # see volume/drivers/manager.py:_create_volume
             self._delete(volume)
             # convert and store into sheepdog
-            image_utils.convert_image(tmp, 'sheepdog:%s' % volume['name'],
+            image_utils.convert_image(tmp, 'sheepdog:%s:%s:%s' % (self.addr, self.port, volume['name']),
                                       'raw')
             self._resize(volume)
 
@@ -194,7 +209,7 @@ class SheepdogDriver(driver.VolumeDriver):
                    '-f', 'raw',
                    '-t', 'none',
                    '-O', 'raw',
-                   'sheepdog:%s' % volume['name'],
+                   'sheepdog:%s:%s:%s' % (self.addr, self.port, volume['name']),
                    tmp)
             self._try_execute(*cmd)
 
@@ -204,15 +219,15 @@ class SheepdogDriver(driver.VolumeDriver):
     def create_snapshot(self, snapshot):
         """Create a sheepdog snapshot."""
         self._try_execute('qemu-img', 'snapshot', '-c', snapshot['name'],
-                          "sheepdog:%s" % snapshot['volume_name'])
+                          "sheepdog:%s:%s:%s" % (self.addr, self.port, snapshot['volume_name']))
 
     def delete_snapshot(self, snapshot):
         """Delete a sheepdog snapshot."""
-        self._try_execute('collie', 'vdi', 'delete', snapshot['volume_name'],
+        self._try_execute('collie', 'vdi', 'delete', '-a', self.addr, '-p', self.port, snapshot['volume_name'],
                           '-s', snapshot['name'])
 
     def local_path(self, volume):
-        return "sheepdog:%s" % volume['name']
+        return "sheepdog:%s:%s:%s" % (self.addr, self.port, volume['name'])
 
     def ensure_export(self, context, volume):
         """Safely and synchronously recreate an export for a logical volume."""
@@ -230,7 +245,9 @@ class SheepdogDriver(driver.VolumeDriver):
         return {
             'driver_volume_type': 'sheepdog',
             'data': {
-                'name': volume['name']
+                'name': volume['name'],
+                'hosts': [self.addr],
+                'ports': [self.port],
             }
         }
 
@@ -245,7 +262,7 @@ class SheepdogDriver(driver.VolumeDriver):
             backend_name = self.configuration.safe_get('volume_backend_name')
         stats["volume_backend_name"] = backend_name or 'sheepdog'
         stats['vendor_name'] = 'Open Source'
-        stats['dirver_version'] = self.VERSION
+        stats['driver_version'] = self.VERSION
         stats['storage_protocol'] = 'sheepdog'
         stats['total_capacity_gb'] = 'unknown'
         stats['free_capacity_gb'] = 'unknown'
@@ -253,7 +270,7 @@ class SheepdogDriver(driver.VolumeDriver):
         stats['QoS_support'] = False
 
         try:
-            stdout, _err = self._execute('collie', 'node', 'info', '-r')
+            stdout, _err = self._execute('collie', 'node', 'info', '-a', self.addr, '-p', self.port, '-r')
             m = self.stats_pattern.match(stdout)
             total = float(m.group(1))
             used = float(m.group(2))

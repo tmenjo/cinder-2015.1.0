@@ -4,6 +4,7 @@
 # Copyright (c) 2014 Clinton Knight.  All rights reserved.
 # Copyright (c) 2014 Alex Meade.  All rights reserved.
 # Copyright (c) 2014 Bob Callaway.  All rights reserved.
+# Copyright (c) 2015 Tom Barron.  All rights reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -24,7 +25,6 @@ import os
 import uuid
 
 from oslo_log import log as logging
-from oslo_utils import units
 import six
 
 from cinder import exception
@@ -198,28 +198,12 @@ class NetAppCmodeNfsDriver(nfs_base.NetAppNfsDriver):
 
         for nfs_share in self._mounted_shares:
 
-            capacity = self._get_extended_capacity_info(nfs_share)
+            capacity = self._get_share_capacity_info(nfs_share)
 
             pool = dict()
             pool['pool_name'] = nfs_share
             pool['QoS_support'] = False
-            pool['reserved_percentage'] = 0
-
-            # Report pool as reserved when over the configured used_ratio
-            if capacity['used_ratio'] > self.configuration.nfs_used_ratio:
-                pool['reserved_percentage'] = 100
-
-            # Report pool as reserved when over the subscribed ratio
-            if capacity['subscribed_ratio'] >=\
-                    self.configuration.nfs_oversub_ratio:
-                pool['reserved_percentage'] = 100
-
-            # convert sizes to GB
-            total = float(capacity['apparent_size']) / units.Gi
-            pool['total_capacity_gb'] = na_utils.round_down(total, '0.01')
-
-            free = float(capacity['apparent_available']) / units.Gi
-            pool['free_capacity_gb'] = na_utils.round_down(free, '0.01')
+            pool.update(capacity)
 
             # add SSC content if available
             vol = self._get_vol_for_share(nfs_share)
@@ -434,9 +418,12 @@ class NetAppCmodeNfsDriver(nfs_base.NetAppNfsDriver):
                         volume['id']))
                     dst_path = os.path.join(
                         self._get_export_path(volume['id']), volume['name'])
+                    # Always run copy offload as regular user, it's sufficient
+                    # and rootwrap doesn't allow copy offload to run as root
+                    # anyways.
                     self._execute(col_path, src_ip, dst_ip,
                                   src_path, dst_path,
-                                  run_as_root=self._execute_as_root,
+                                  run_as_root=False,
                                   check_exit_code=0)
                     self._register_image_in_cache(volume, image_id)
                     LOG.debug("Copied image from cache to volume %s using"
@@ -466,13 +453,22 @@ class NetAppCmodeNfsDriver(nfs_base.NetAppNfsDriver):
         """Copies from the image service using copy offload."""
         LOG.debug("Trying copy from image service using copy offload.")
         image_loc = image_service.get_location(context, image_id)
-        image_loc = self._construct_image_nfs_url(image_loc)
-        conn, dr = self._check_get_nfs_path_segs(image_loc)
-        if conn:
-            src_ip = self._get_ip_verify_on_cluster(conn.split(':')[0])
-        else:
+        locations = self._construct_image_nfs_url(image_loc)
+        src_ip = None
+        selected_loc = None
+        # this will match the first location that has a valid IP on cluster
+        for location in locations:
+            conn, dr = self._check_get_nfs_path_segs(location)
+            if conn:
+                try:
+                    src_ip = self._get_ip_verify_on_cluster(conn.split(':')[0])
+                    selected_loc = location
+                    break
+                except Exception.NotFound:
+                    pass
+        if src_ip is None:
             raise exception.NotFound(_("Source host details not found."))
-        (__, ___, img_file) = image_loc.rpartition('/')
+        (__, ___, img_file) = selected_loc.rpartition('/')
         src_path = os.path.join(dr, img_file)
         dst_ip = self._get_ip_verify_on_cluster(self._get_host_ip(
             volume['id']))
@@ -492,8 +488,11 @@ class NetAppCmodeNfsDriver(nfs_base.NetAppNfsDriver):
                     ('%s:%s' % (dst_ip, self._get_export_path(volume['id'])))):
                 dst_img_serv_path = os.path.join(
                     self._get_export_path(volume['id']), tmp_img_file)
+                # Always run copy offload as regular user, it's sufficient
+                # and rootwrap doesn't allow copy offload to run as root
+                # anyways.
                 self._execute(col_path, src_ip, dst_ip, src_path,
-                              dst_img_serv_path, run_as_root=run_as_root,
+                              dst_img_serv_path, run_as_root=False,
                               check_exit_code=0)
             else:
                 self._clone_file_dst_exists(dst_share, img_file, tmp_img_file)

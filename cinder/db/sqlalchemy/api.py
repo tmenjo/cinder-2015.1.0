@@ -928,9 +928,26 @@ def reservation_rollback(context, reservations, project_id=None):
             reservation.delete(session=session)
 
 
+def quota_destroy_by_project(*args, **kwargs):
+    """Destroy all limit quotas associated with a project.
+
+    Leaves usage and reservation quotas intact.
+    """
+    quota_destroy_all_by_project(only_quotas=True, *args, **kwargs)
+
+
 @require_admin_context
 @_retry_on_deadlock
-def quota_destroy_all_by_project(context, project_id):
+def quota_destroy_all_by_project(context, project_id, only_quotas=False):
+    """Destroy all quotas associated with a project.
+
+    This includes limit quotas, usage quotas and reservation quotas.
+    Optionally can only remove limit quotas and leave other types as they are.
+
+    :param context: The request context, for access checks.
+    :param project_id: The ID of the project being deleted.
+    :param only_quotas: Only delete limit quotas, leave other types intact.
+    """
     session = get_session()
     with session.begin():
         quotas = model_query(context, models.Quota, session=session,
@@ -940,6 +957,9 @@ def quota_destroy_all_by_project(context, project_id):
 
         for quota_ref in quotas:
             quota_ref.delete(session=session)
+
+        if only_quotas:
+            return
 
         quota_usages = model_query(context, models.QuotaUsage,
                                    session=session, read_deleted="no").\
@@ -1118,10 +1138,27 @@ def volume_data_get_for_project(context, project_id, volume_type_id=None):
 
 @require_admin_context
 def finish_volume_migration(context, src_vol_id, dest_vol_id):
-    """Copy almost all columns from dest to source."""
+    """Swap almost all columns between dest and source.
+
+    We swap fields between source and destination at the end of migration
+    because we want to keep the original volume id in the DB but now pointing
+    to the migrated volume.
+
+    Original volume will be deleted, after this method original volume will be
+    pointed by dest_vol_id, so we set its status and migrating_status to
+    'deleting'.  We change status here to keep it in sync with migration_status
+    which must be changed here.
+
+    param src_vol_id:: ID of the migration original volume
+    param dest_vol_id: ID of the migration destination volume
+    returns: Tuple with new source and destination ORM objects.  Source will be
+             the migrated volume and destination will be original volume that
+             will be deleted.
+    """
     session = get_session()
     with session.begin():
         src_volume_ref = _volume_get(context, src_vol_id, session=session)
+        src_original_data = dict(src_volume_ref.iteritems())
         dest_volume_ref = _volume_get(context, dest_vol_id, session=session)
 
         # NOTE(rpodolyaka): we should copy only column values, while model
@@ -1131,14 +1168,30 @@ def finish_volume_migration(context, src_vol_id, dest_vol_id):
             return attr in inst.__class__.__table__.columns
 
         for key, value in dest_volume_ref.iteritems():
-            if key == 'id' or not is_column(dest_volume_ref, key):
+            value_to_dst = src_original_data.get(key)
+            # The implementation of update_migrated_volume will decide the
+            # values for _name_id and provider_location.
+            if (key in ('id', 'provider_location')
+                    or not is_column(dest_volume_ref, key)):
+                continue
+
+            # Destination must have a _name_id since the id no longer matches
+            # the volume.  If it doesn't have a _name_id we set one.
+            elif key == '_name_id':
+                if not dest_volume_ref._name_id:
+                    setattr(dest_volume_ref, key, src_volume_ref.id)
                 continue
             elif key == 'migration_status':
                 value = None
-            elif key == '_name_id':
-                value = dest_volume_ref['_name_id'] or dest_volume_ref['id']
+                value_to_dst = 'deleting'
+            elif key == 'display_description':
+                value_to_dst = 'migration src for ' + src_volume_ref.id
+            elif key == 'status':
+                value_to_dst = 'deleting'
 
             setattr(src_volume_ref, key, value)
+            setattr(dest_volume_ref, key, value_to_dst)
+    return src_volume_ref, dest_volume_ref
 
 
 @require_admin_context
@@ -1152,7 +1205,8 @@ def volume_destroy(context, volume_id):
             update({'status': 'deleted',
                     'deleted': True,
                     'deleted_at': now,
-                    'updated_at': literal_column('updated_at')})
+                    'updated_at': literal_column('updated_at'),
+                    'migration_status': None})
         model_query(context, models.IscsiTarget, session=session).\
             filter_by(volume_id=volume_id).\
             update({'volume_id': None})

@@ -4,6 +4,7 @@
 # Copyright (c) 2014 Clinton Knight.  All rights reserved.
 # Copyright (c) 2014 Alex Meade.  All rights reserved.
 # Copyright (c) 2014 Bob Callaway.  All rights reserved.
+# Copyright (c) 2015 Tom Barron.  All rights reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
 #    not use this file except in compliance with the License. You may obtain
@@ -73,6 +74,7 @@ class NetAppNfsDriver(nfs.NfsDriver):
         super(NetAppNfsDriver, self).do_setup(context)
         self._context = context
         na_utils.check_flags(self.REQUIRED_FLAGS, self.configuration)
+        self.zapi_client = None
 
     def check_for_setup_error(self):
         """Returns an error if prerequisites aren't met."""
@@ -292,7 +294,7 @@ class NetAppNfsDriver(nfs.NfsDriver):
                 self.configuration.thres_avl_size_perc_stop
             for share in getattr(self, '_mounted_shares', []):
                 try:
-                    total_size, total_avl, _total_alc = \
+                    total_size, total_avl = \
                         self._get_capacity_info(share)
                     avl_percent = int((total_avl / total_size) * 100)
                     if avl_percent <= thres_size_perc_start:
@@ -433,40 +435,43 @@ class NetAppNfsDriver(nfs.NfsDriver):
         """Clone directly in nfs share."""
         LOG.info(_LI('Checking image clone %s from glance share.'), image_id)
         cloned = False
-        image_location = self._construct_image_nfs_url(image_location)
-        share = self._is_cloneable_share(image_location)
+        image_locations = self._construct_image_nfs_url(image_location)
         run_as_root = self._execute_as_root
-
-        if share and self._is_share_vol_compatible(volume, share):
-            LOG.debug('Share is cloneable %s', share)
-            volume['provider_location'] = share
-            (__, ___, img_file) = image_location.rpartition('/')
-            dir_path = self._get_mount_point_for_share(share)
-            img_path = '%s/%s' % (dir_path, img_file)
-            img_info = image_utils.qemu_img_info(img_path,
-                                                 run_as_root=run_as_root)
-            if img_info.file_format == 'raw':
-                LOG.debug('Image is raw %s', image_id)
-                self._clone_volume(
-                    img_file, volume['name'],
-                    volume_id=None, share=share)
-                cloned = True
-            else:
-                LOG.info(
-                    _LI('Image will locally be converted to raw %s'),
-                    image_id)
-                dst = '%s/%s' % (dir_path, volume['name'])
-                image_utils.convert_image(img_path, dst, 'raw',
-                                          run_as_root=run_as_root)
-                data = image_utils.qemu_img_info(dst, run_as_root=run_as_root)
-                if data.file_format != "raw":
-                    raise exception.InvalidResults(
-                        _("Converted to raw, but"
-                          " format is now %s") % data.file_format)
-                else:
+        for loc in image_locations:
+            share = self._is_cloneable_share(loc)
+            if share and self._is_share_vol_compatible(volume, share):
+                LOG.debug('Share is cloneable %s', share)
+                volume['provider_location'] = share
+                (__, ___, img_file) = loc.rpartition('/')
+                dir_path = self._get_mount_point_for_share(share)
+                img_path = '%s/%s' % (dir_path, img_file)
+                img_info = image_utils.qemu_img_info(img_path,
+                                                     run_as_root=run_as_root)
+                if img_info.file_format == 'raw':
+                    LOG.debug('Image is raw %s', image_id)
+                    self._clone_volume(
+                        img_file, volume['name'],
+                        volume_id=None, share=share)
                     cloned = True
-                    self._register_image_in_cache(
-                        volume, image_id)
+                    break
+                else:
+                    LOG.info(
+                        _LI('Image will locally be converted to raw %s'),
+                        image_id)
+                    dst = '%s/%s' % (dir_path, volume['name'])
+                    image_utils.convert_image(img_path, dst, 'raw',
+                                              run_as_root=run_as_root)
+                    data = image_utils.qemu_img_info(dst,
+                                                     run_as_root=run_as_root)
+                    if data.file_format != "raw":
+                        raise exception.InvalidResults(
+                            _("Converted to raw, but"
+                              " format is now %s") % data.file_format)
+                    else:
+                        cloned = True
+                        self._register_image_in_cache(
+                            volume, image_id)
+                        break
         return cloned
 
     def _post_clone_image(self, volume):
@@ -583,7 +588,7 @@ class NetAppNfsDriver(nfs.NfsDriver):
 
              It creates direct url from image_location
              which is a tuple with direct_url and locations.
-             Returns url with nfs scheme if nfs store
+             Returns array of urls with nfs scheme if nfs store
              else returns url. It needs to be verified
              by backend before use.
         """
@@ -592,26 +597,30 @@ class NetAppNfsDriver(nfs.NfsDriver):
         if not direct_url and not locations:
             raise exception.NotFound(_('Image location not present.'))
 
-        # Locations will be always a list of one until
-        # bp multiple-image-locations is introduced
+        urls = []
         if not locations:
-            return direct_url
-        location = locations[0]
-        url = location['url']
-        if not location['metadata']:
-            return url
-        location_type = location['metadata'].get('type')
-        if not location_type or location_type.lower() != "nfs":
-            return url
-        share_location = location['metadata'].get('share_location')
-        mount_point = location['metadata'].get('mount_point')
-        if not share_location or not mount_point:
-            return url
-        url_parse = urlparse.urlparse(url)
-        abs_path = os.path.join(url_parse.netloc, url_parse.path)
-        rel_path = os.path.relpath(abs_path, mount_point)
-        direct_url = "%s/%s" % (share_location, rel_path)
-        return direct_url
+            urls.append(direct_url)
+        else:
+            for location in locations:
+                url = location['url']
+                if not location['metadata']:
+                    urls.append(url)
+                    break
+                location_type = location['metadata'].get('type')
+                if not location_type or location_type.lower() != "nfs":
+                    urls.append(url)
+                    break
+                share_location = location['metadata'].get('share_location')
+                mountpoint = location['metadata'].get('mountpoint')
+                if not share_location or not mountpoint:
+                    urls.append(url)
+                    break
+                url_parse = urlparse.urlparse(url)
+                abs_path = os.path.join(url_parse.netloc, url_parse.path)
+                rel_path = os.path.relpath(abs_path, mountpoint)
+                direct_url = "%s/%s" % (share_location, rel_path)
+                urls.append(direct_url)
+        return urls
 
     def extend_volume(self, volume, new_size):
         """Extend an existing volume to the new size."""
@@ -625,7 +634,7 @@ class NetAppNfsDriver(nfs.NfsDriver):
 
     def _check_share_can_hold_size(self, share, size):
         """Checks if volume can hold image with size."""
-        _tot_size, tot_available, _tot_allocated = self._get_capacity_info(
+        _tot_size, tot_available = self._get_capacity_info(
             share)
         if tot_available < size:
             msg = _("Container size smaller than required file size.")
@@ -666,22 +675,38 @@ class NetAppNfsDriver(nfs.NfsDriver):
                 'A volume ID or share was not specified.')
         return host_ip, export_path
 
-    def _get_extended_capacity_info(self, nfs_share):
-        """Returns an extended set of share capacity metrics."""
+    def _get_share_capacity_info(self, nfs_share):
+        """Returns the share capacity metrics needed by the scheduler."""
 
-        total_size, total_available, total_allocated = \
-            self._get_capacity_info(nfs_share)
+        used_ratio = self.configuration.nfs_used_ratio
+        oversub_ratio = self.configuration.nfs_oversub_ratio
 
-        used_ratio = (total_size - total_available) / total_size
-        subscribed_ratio = total_allocated / total_size
-        apparent_size = max(0, total_size * self.configuration.nfs_used_ratio)
-        apparent_available = max(0, apparent_size - total_allocated)
+        # The scheduler's capacity filter will reduce the amount of
+        # free space that we report to it by the reserved percentage.
+        reserved_ratio = 1 - used_ratio
+        reserved_percentage = round(100 * reserved_ratio)
 
-        return {'total_size': total_size, 'total_available': total_available,
-                'total_allocated': total_allocated, 'used_ratio': used_ratio,
-                'subscribed_ratio': subscribed_ratio,
-                'apparent_size': apparent_size,
-                'apparent_available': apparent_available}
+        total_size, total_available = self._get_capacity_info(nfs_share)
+
+        apparent_size = total_size * oversub_ratio
+        apparent_size_gb = na_utils.round_down(
+            apparent_size / units.Gi, '0.01')
+
+        apparent_free_size = total_available * oversub_ratio
+        apparent_free_gb = na_utils.round_down(
+            float(apparent_free_size) / units.Gi, '0.01')
+
+        capacity = dict()
+        capacity['reserved_percentage'] = reserved_percentage
+        capacity['total_capacity_gb'] = apparent_size_gb
+        capacity['free_capacity_gb'] = apparent_free_gb
+
+        return capacity
+
+    def _get_capacity_info(self, nfs_share):
+        """Get total capacity and free capacity in bytes for an nfs share."""
+        export_path = nfs_share.rsplit(':', 1)[1]
+        return self.zapi_client.get_flexvol_capacity(export_path)
 
     def _check_volume_type(self, volume, share, file_name):
         """Match volume type for share file."""

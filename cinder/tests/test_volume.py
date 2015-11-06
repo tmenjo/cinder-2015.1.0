@@ -3638,6 +3638,35 @@ class VolumeTestCase(BaseVolumeTestCase):
         self.volume.delete_volume(self.context, volume_dst['id'])
         self.volume.delete_volume(self.context, volume_src['id'])
 
+    @mock.patch('cinder.db.volume_update')
+    def test_update_migrated_volume(self, volume_update):
+        fake_host = 'fake_host'
+        fake_new_host = 'fake_new_host'
+        fake_update = {'_name_id': 'updated_id',
+                       'provider_location': 'updated_location'}
+        fake_elevated = 'fake_elevated'
+        volume = tests_utils.create_volume(self.context, size=1,
+                                           status='available',
+                                           host=fake_host)
+        new_volume = tests_utils.create_volume(self.context, size=1,
+                                               status='available',
+                                               host=fake_new_host)
+        new_volume['_name_id'] = 'fake_name_id'
+        new_volume['provider_location'] = 'fake_provider_location'
+        expected_update = {'_name_id': volume['_name_id'],
+                           'provider_location': volume['provider_location']}
+        with mock.patch.object(self.volume.driver,
+                               'update_migrated_volume') as \
+                migrate_update,\
+                mock.patch.object(self.context, 'elevated') as elevated:
+            migrate_update.return_value = fake_update
+            elevated.return_value = fake_elevated
+            self.volume.update_migrated_volume(self.context, volume,
+                                               new_volume)
+            volume_update.assert_has_calls([
+                mock.call(fake_elevated, volume['id'], fake_update),
+                mock.call(fake_elevated, new_volume['id'], expected_update)])
+
     def test_list_availability_zones_enabled_service(self):
         services = [
             {'availability_zone': 'ping', 'disabled': 0},
@@ -3771,7 +3800,7 @@ class VolumeTestCase(BaseVolumeTestCase):
     @mock.patch.object(volume_rpcapi.VolumeAPI, 'delete_volume')
     @mock.patch.object(volume_rpcapi.VolumeAPI, 'create_volume')
     def test_migrate_volume_for_volume_generic(self, create_volume,
-                                               delete_volume,
+                                               rpc_delete_volume,
                                                update_migrated_volume):
         fake_volume = tests_utils.create_volume(self.context, size=1,
                                                 host=CONF.host)
@@ -3784,7 +3813,9 @@ class VolumeTestCase(BaseVolumeTestCase):
         host_obj = {'host': 'newhost', 'capabilities': {}}
         with mock.patch.object(self.volume.driver, 'migrate_volume') as \
                 mock_migrate_volume,\
-                mock.patch.object(self.volume.driver, 'copy_volume_data'):
+                mock.patch.object(self.volume.driver, 'copy_volume_data'), \
+                mock.patch.object(self.volume.driver, 'delete_volume') as \
+                delete_volume:
             create_volume.side_effect = fake_create_volume
             self.volume.migrate_volume(self.context, fake_volume['id'],
                                        host_obj, True)
@@ -3794,6 +3825,7 @@ class VolumeTestCase(BaseVolumeTestCase):
             self.assertIsNone(volume['migration_status'])
             self.assertFalse(mock_migrate_volume.called)
             self.assertFalse(delete_volume.called)
+            self.assertTrue(rpc_delete_volume.called)
             self.assertTrue(update_migrated_volume.called)
 
     def test_migrate_volume_generic_copy_error(self):
@@ -4023,12 +4055,14 @@ class VolumeTestCase(BaseVolumeTestCase):
             self.assertEqual(vol['status'], 'in-use')
             attachment_id = vol['volume_attachment'][0]['id']
         target_status = 'target:%s' % old_volume['id']
+        new_host = CONF.host + 'new'
         new_volume = tests_utils.create_volume(self.context, size=0,
-                                               host=CONF.host,
+                                               host=new_host,
                                                migration_status=target_status)
         with mock.patch.object(self.volume, 'detach_volume') as \
                 mock_detach_volume,\
-                mock.patch.object(volume_rpcapi.VolumeAPI, 'delete_volume'),\
+                mock.patch.object(volume_rpcapi.VolumeAPI, 'delete_volume') as \
+                mock_delete_volume, \
                 mock.patch.object(volume_rpcapi.VolumeAPI, 'attach_volume') as \
                 mock_attach_volume,\
                 mock.patch.object(volume_rpcapi.VolumeAPI,
@@ -4037,6 +4071,8 @@ class VolumeTestCase(BaseVolumeTestCase):
             mock_attach_volume.side_effect = fake_attach_volume
             self.volume.migrate_volume_completion(self.context, old_volume[
                 'id'], new_volume['id'])
+            after_new_volume = db.volume_get(self.context, new_volume.id)
+            after_old_volume = db.volume_get(self.context, old_volume.id)
             if status == 'in-use':
                 mock_detach_volume.assert_called_with(self.context,
                                                       old_volume['id'],
@@ -4048,6 +4084,9 @@ class VolumeTestCase(BaseVolumeTestCase):
                 self.assertEqual(attachment['instance_uuid'], instance_uuid)
             else:
                 self.assertFalse(mock_detach_volume.called)
+            self.assertTrue(mock_delete_volume.called)
+            self.assertEqual(old_volume.host, after_new_volume.host)
+            self.assertEqual(new_volume.host, after_old_volume.host)
 
     def test_migrate_volume_completion_retype_available(self):
         self._test_migrate_volume_completion('available', retyping=True)

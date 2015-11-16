@@ -40,7 +40,6 @@ sheepdog_opts = [
                default='127.0.0.1',
                help=('IP address of sheep daemon.')),
     cfg.IntOpt('sheepdog_store_port',
-               min=1, max=65535,
                default=7000,
                help=('Port of sheep daemon.'))
 ]
